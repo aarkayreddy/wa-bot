@@ -1,159 +1,144 @@
-const express = require('express');
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode');
+const express = require("express");
+const cors = require("cors");
+const { Client, LocalAuth } = require("whatsapp-web.js");
+const qrcode = require("qrcode");
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Create a new WhatsApp client
-const client = new Client({
-    authStrategy: new LocalAuth()
-});
-
-// Parse JSON bodies (as sent by API clients)
+// ===== Middleware =====
+app.use(cors());
 app.use(express.json());
 
+// ===== Basic Auth Protection (IMPORTANT) =====
+const API_KEY = "YOUR_SECRET_KEY";
+
 app.use((req, res, next) => {
-    console.log(`Received request at: ${req.url}`);
-    next();
+  if (req.path === "/status" || req.path === "/qr") return next();
+
+  const authHeader = req.headers.authorization;
+  if (authHeader !== `Bearer ${API_KEY}`) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  next();
+});
+
+// ===== WhatsApp Client =====
+const client = new Client({
+  authStrategy: new LocalAuth(),
+  puppeteer: {
+    headless: true,
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+  },
 });
 
 let qrCodeData = null;
+let isClientReady = false;
 
 client.on("qr", (qr) => {
-    qrCodeData = qr; // Store the QR code
-    console.log("Scan this QR Code to log in.");
+  console.log("QR received");
+  qrCodeData = qr;
 });
 
-client.on('ready', () => {
-    console.log('WhatsApp client is ready!');
-});
-
-client.on("authenticated", () => {
-    console.log("Authenticated with WhatsApp!");
+client.on("ready", () => {
+  console.log("WhatsApp client is ready!");
+  isClientReady = true;
+  qrCodeData = null;
 });
 
 client.on("auth_failure", (msg) => {
-    console.error("Authentication failed:", msg);
+  console.error("Auth failure:", msg);
 });
 
 client.initialize();
 
-// Endpoint to get QR Code
+// ======================================================
+// ================= MOBILE API ENDPOINTS ===============
+// ======================================================
+
+// 1️⃣ Check WhatsApp Status
+app.get("/status", (req, res) => {
+  res.json({
+    ready: isClientReady,
+  });
+});
+
+// 2️⃣ Get QR Code (Base64 Image)
 app.get("/qr", async (req, res) => {
-    if (!qrCodeData) {
-        return res.send("QR Code not available yet.");
-    }
-    const qrImage = await qrcode.toDataURL(qrCodeData);
-    res.send(`<img src="${qrImage}" />`);
+  if (!qrCodeData) {
+    return res.json({ qr: null });
+  }
+
+  const qrImage = await qrcode.toDataURL(qrCodeData);
+  res.json({ qr: qrImage });
 });
 
-// Endpoint to get contacts
-app.get("/contacts", async (req, res) => {
-    try {
-        const contacts = await client.getContacts();
-        res.json(contacts);
-    } catch (error) {
-        res.status(500).json({ error: "Failed to fetch contacts" });
-    }
+// 3️⃣ Get Chats List
+app.get("/chats", async (req, res) => {
+  try {
+    const chats = await client.getChats();
+
+    const formattedChats = chats.map((chat) => ({
+      id: chat.id._serialized,
+      name: chat.name || chat.id.user,
+      isGroup: chat.isGroup,
+      unreadCount: chat.unreadCount,
+    }));
+
+    res.json(formattedChats);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Failed to fetch chats" });
+  }
 });
 
+// 4️⃣ Get Messages of a Chat
+app.get("/messages/:chatId", async (req, res) => {
+  try {
+    const { chatId } = req.params;
 
-// API endpoint to send a message
-app.post('/send-message', async (req, res) => {
-    const { number, message } = req.body;
+    const chat = await client.getChatById(chatId);
+    const messages = await chat.fetchMessages({ limit: 30 });
 
-    if (!number || !message) {
-        return res.status(400).json({ error: 'Please provide both number and message' });
-    }
+    const formattedMessages = messages.map((msg) => ({
+      id: msg.id._serialized,
+      from: msg.from,
+      fromMe: msg.fromMe,
+      body: msg.body,
+      timestamp: msg.timestamp,
+    }));
 
-    try {
-        const chatId = `${number}@c.us`;
-        await client.sendMessage(chatId, message);
-        res.status(200).json({ success: 'Message sent successfully' });
-    } catch (error) {
-        res.status(500).json({ error: 'Failed to send message' });
-    }
+    res.json(formattedMessages);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Failed to fetch messages" });
+  }
 });
 
-// API endpoint to get messages from a chat
-app.get('/get-messages/:number', async (req, res) => {
-    const number = req.params.number;
+// 5️⃣ Send Message
+app.post("/send", async (req, res) => {
+  try {
+    const { chatId, message } = req.body;
 
-    if (!number) {
-        return res.status(400).json({ error: 'Please provide a number' });
+    if (!chatId || !message) {
+      return res.status(400).json({
+        error: "chatId and message are required",
+      });
     }
 
-    try {
-        const chatId = `${number}@c.us`;
-        const chat = await client.getChatById(chatId);
-        const messages = await chat.fetchMessages({ limit: 10 });
+    await client.sendMessage(chatId, message);
 
-        res.status(200).json(messages);
-    } catch (error) {
-        res.status(500).json({ error: 'Failed to get messages' });
-    }
+    res.json({
+      success: true,
+      message: "Message sent successfully",
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Failed to send message" });
+  }
 });
 
-const convertToIST = (timestamp) => {
-    const date = new Date(timestamp * 1000);
-    const options = { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' };
-    return date.toLocaleString('en-IN', options);
-};
-
-// api to get all conversations
-app.get('/get-conversations', async (req, res) => {
-    try {
-        const chats = await client.getChats();
-        const conversations = [];
-
-        for (const chat of chats) {
-            const messages = await chat.fetchMessages({ limit: 50 });
-            const conversation = {
-                chatId: chat.id._serialized,
-                contact: {},
-                messages: [],
-            };
-
-            for (const msg of messages) {
-                const toNumber = msg.to ? msg.to.split('@')[0] : 'unknown';
-
-                if (!conversation.contact[toNumber]) {
-                    try {
-                        const contact = await client.getContactById(msg.to);
-                        conversation.contact[toNumber] = {
-                            id: contact.id._serialized,
-                            name: contact.pushname || contact.name || 'Unknown',
-                            number: toNumber
-                        };
-                    } catch (contactError) {
-                        console.error('Failed to get contact info:', contactError);
-                    }
-                }
-
-                // Convert timestamp to IST
-                const formattedDate = convertToIST(msg.timestamp);
-
-                conversation.messages.push({
-                    id: msg.id._serialized,
-                    from: msg.from,
-                    to: msg.to,
-                    body: msg.body,
-                    dateTime: formattedDate,
-                });
-            }
-
-            conversations.push(conversation);
-        }
-
-        res.status(200).json(conversations);
-    } catch (error) {
-        console.error('Failed to get conversations:', error);
-        res.status(500).json({ error: 'Failed to get conversations' });
-    }
-});
-
-
+// ===== Start Server =====
 app.listen(port, () => {
-    console.log(`Server is running on http://localhost:${port}`);
+  console.log(`WhatsApp API running on http://localhost:${port}`);
 });
